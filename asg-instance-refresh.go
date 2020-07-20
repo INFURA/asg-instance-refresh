@@ -65,5 +65,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("Refresh started with request ID", result.InstanceRefreshId)
+	fmt.Printf("Refresh started on ASG %s with request ID %s\n", asg, *result.InstanceRefreshId)
 }
