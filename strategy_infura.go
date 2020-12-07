@@ -20,6 +20,9 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 
 	sess := session.Must(session.NewSession(aws.NewConfig().WithRegion(region)))
 
+	// Record rollbacks during the procedure to get back on a reasonable state if the context get cancelled
+	var rollbacks []func(ctx context.Context) error
+
 	start := time.Now()
 
 	originalAsg, err := getASGDetails(ctx, sess, asgName)
@@ -27,49 +30,66 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 		return err
 	}
 
-	log.Printf("Refresh started (asg: %s, region: %s, strategy: infura-refresh)\n", asgName, region)
+	log.Printf("Refresh started (asg: %s, region: %s, strategy: infura-refresh)", asgName, region)
 	log.Printf("ASG protect instances by default: %v", originalAsg.newInstanceProtected)
-	log.Printf("Existing instances:\n")
+	log.Printf("Existing instances:")
 	for _, inst := range originalAsg.instances {
-		log.Printf("\t%s\n", inst)
+		log.Printf("\t%s", inst)
 	}
 
-	// Record rollbacks during the procedure to get back on a reasonable state if the context get cancelled
-	// var rollbacks []func(ctx context.Context) error
-	//
-	// rollbacks = append(rollbacks, func(ctx context.Context) error {
-	// 	return updateASG(ctx, as, asgName, originalAsg.maxSize, originalAsg.desiredCapacity)
-	// })
-
 	// Set instance protection on the old instances to be sure we keep having them around in case of failure
-	log.Printf("Enable instance protection on old instances\n")
-	err = setInstanceProtection(ctx, sess, asgName, originalAsg.instances)
-	if err != nil {
-		return err
+	log.Printf("Enable instance protection on old instances")
+	{
+		if !originalAsg.newInstanceProtected {
+			rollbacks = append(rollbacks, func(ctx context.Context) error {
+				log.Printf("Removing instance protection on old instances")
+				return removeInstanceProtection(ctx, sess, asgName, originalAsg.instances)
+			})
+		}
+
+		err = setInstanceProtection(ctx, sess, asgName, originalAsg.instances)
+		if err != nil {
+			rollback(err, rollbacks)
+			return err
+		}
 	}
 
 	// Double the ASG sizes
 	log.Printf("Double the ASG size:")
 	log.Printf("\tmaxSize %d-->%d", originalAsg.maxSize, 2*originalAsg.maxSize)
 	log.Printf("\tdesiredCapacity %d-->%d", originalAsg.desiredCapacity, 2*originalAsg.desiredCapacity)
-	err = updateASG(ctx, sess, asgName, 2*originalAsg.maxSize, 2*originalAsg.desiredCapacity, true)
+	{
+		rollbacks = append(rollbacks, func(ctx context.Context) error {
+			// Simple wait instead of monitoring the instances because we are already in a broken situation.
+			log.Printf("Wait 10 min for the ASG to stabilize")
+			time.Sleep(10 * time.Minute)
+			return nil
+		})
+		rollbacks = append(rollbacks, func(ctx context.Context) error {
+			log.Printf("Rolling back ASG settings")
+			return updateASG(ctx, sess, asgName, originalAsg.maxSize, originalAsg.desiredCapacity, originalAsg.newInstanceProtected)
+		})
+
+		err = updateASG(ctx, sess, asgName, 2*originalAsg.maxSize, 2*originalAsg.desiredCapacity, true)
+		if err != nil {
+			rollback(err, rollbacks)
+			return err
+		}
+	}
+
+	log.Printf("Detect new instances and wait for them to be healthy")
+	newInstances, err := waitForNewInstances(ctx, sess, asgName, int(originalAsg.desiredCapacity), originalAsg.tg, originalAsg.instances)
 	if err != nil {
+		rollback(err, rollbacks)
 		return err
 	}
 
-	log.Printf("Detect new instances and wait for them to be healthy\n")
-	newInstances, err := waitForNewInstances(ctx, sess, asgName, int(originalAsg.desiredCapacity), originalAsg.tg, originalAsg.instances)
-	if err != nil {
-		// rollback !
-		// TODO
-	}
-
 	// unprotect the old instances
-	log.Printf("Remove instance protection on the old instances\n")
+	log.Printf("Remove instance protection on the old instances")
 	err = removeInstanceProtection(ctx, sess, asgName, originalAsg.instances)
 	if err != nil {
-		// rollback !
-		// TODO
+		rollback(err, rollbacks)
+		return err
 	}
 
 	// get back to normal size, cull the old instances
@@ -78,32 +98,68 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	log.Printf("\tdesiredCapacity %d-->%d", 2*originalAsg.desiredCapacity, originalAsg.desiredCapacity)
 	err = updateASG(ctx, sess, asgName, originalAsg.maxSize, originalAsg.desiredCapacity, originalAsg.newInstanceProtected)
 	if err != nil {
-		// rollback !
-		// TODO
+		rollback(err, rollbacks)
 		return err
 	}
 
-	log.Printf("Wait for scaling in\n")
-	err = waitForInstanceCount(ctx, sess, asgName, int(originalAsg.desiredCapacity))
-	if err != nil {
-		// rollback !
-		// TODO
-		return err
+	// At this point:
+	// - the ASG is back to normal
+	// - old instances have the protection disabled
+	// - new instances have the protection enabled
+	// For the rollback:
+	// - wait 10 minutes to give the ASG a chance to stabilize with keeping the new instances and removing the old ones
+	// - make sure to remove have the protection set as desired on the new instances
+	log.Printf("Wait for scaling in")
+	{
+		rollbacks = []func(ctx context.Context) error{
+			func(ctx context.Context) error {
+				log.Printf("Wait 10 min for the ASG to stabilize")
+				time.Sleep(10 * time.Minute)
+				if !originalAsg.newInstanceProtected {
+					log.Printf("Remove instance protection on the new instances")
+					return removeInstanceProtection(ctx, sess, asgName, newInstances)
+				}
+				return nil
+			},
+		}
+
+		err = waitForInstanceCount(ctx, sess, asgName, int(originalAsg.desiredCapacity))
+		if err != nil {
+			rollback(err, rollbacks)
+			return err
+		}
 	}
 
 	// unprotect the new instances if needed
 	if !originalAsg.newInstanceProtected {
-		log.Printf("Remove instance protection on the new instances\n")
+		log.Printf("Remove instance protection on the new instances")
 		err = removeInstanceProtection(ctx, sess, asgName, newInstances)
 		if err != nil {
-			// rollback !
-			// TODO
+			return err
 		}
 	}
 
-	log.Printf("Done in %s.\n", time.Since(start))
+	log.Printf("Done in %s.", time.Since(start))
 
 	return nil
+}
+
+func rollback(err error, steps []func(ctx context.Context) error) {
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	log.Printf("======================================================")
+	log.Printf("ROLLBACK due to error: %v", err)
+	log.Printf("======================================================")
+
+	// rolling back in opposite order
+	for i := len(steps) - 1; i >= 0; i-- {
+		err := steps[i](rollbackCtx)
+		if err != nil {
+			log.Printf("-> Error during rollback: %v", err)
+			log.Printf("-> Attempting to continue rollback")
+		}
+	}
 }
 
 type asg struct {
@@ -226,7 +282,7 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 			case <-ctx.Done():
 				return
 			case err := <-chanErr:
-				log.Printf("error while polling ASG details: %v\n", err)
+				log.Printf("error while polling ASG details: %v", err)
 				continue
 			}
 		}
@@ -245,11 +301,11 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case err := <-chanErr2:
-			log.Printf("error while polling autoscaling or target group reported target health: %v\n", err)
+			log.Printf("error while polling autoscaling or target group reported target health: %v", err)
 			continue
 		case inst := <-readyInstances:
 			instanceReady = append(instanceReady, inst)
-			log.Printf("\t(%d/%d) Instance %s is ready\n", len(instanceReady), count, inst.instanceId)
+			log.Printf("\t(%d/%d) Instance %s is ready", len(instanceReady), count, inst.instanceId)
 			if len(instanceReady) >= count {
 				return instanceReady, nil
 			}
@@ -302,7 +358,7 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tg *target
 	chanOut := make(chan instance)
 	chanErr := make(chan error)
 
-	period := 10 * time.Second
+	period := 20 * time.Second
 
 	go func() {
 		defer close(chanOut)
@@ -315,7 +371,7 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tg *target
 			case <-ctx.Done():
 				return
 			case inst := <-newInstances:
-				log.Printf("\tfound new instance: %s\n", inst)
+				log.Printf("\tfound new instance: %s", inst)
 				instanceSet[inst.instanceId] = inst
 			case <-time.After(period):
 				// wait to have at least one instance to inspect
@@ -338,6 +394,11 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tg *target
 					delete(instanceSet, inst.instanceId)
 					chanOut <- inst
 				}
+				continue
+			}
+
+			if len(healthyInstances) == 0 {
+				// wait to have at least some instance ASG ready
 				continue
 			}
 
@@ -436,7 +497,7 @@ func waitForInstanceCount(ctx context.Context, sess *session.Session, asgName st
 			return err
 		}
 
-		log.Printf("\tInstance count: %d\n", len(asg.instances))
+		log.Printf("\tInstance count: %d", len(asg.instances))
 		if len(asg.instances) <= count {
 			return nil
 		}
