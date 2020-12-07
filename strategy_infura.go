@@ -28,6 +28,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	}
 
 	log.Printf("Refresh started (asg: %s, region: %s, strategy: infura-refresh)\n", asgName, region)
+	log.Printf("ASG protect instances by default: %v", originalAsg.newInstanceProtected)
 	log.Printf("Existing instances:\n")
 	for _, inst := range originalAsg.instances {
 		log.Printf("\t%s\n", inst)
@@ -37,7 +38,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	// var rollbacks []func(ctx context.Context) error
 	//
 	// rollbacks = append(rollbacks, func(ctx context.Context) error {
-	// 	return setASGCapacities(ctx, as, asgName, originalAsg.maxSize, originalAsg.desiredCapacity)
+	// 	return updateASG(ctx, as, asgName, originalAsg.maxSize, originalAsg.desiredCapacity)
 	// })
 
 	// Set instance protection on the old instances to be sure we keep having them around in case of failure
@@ -51,21 +52,13 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	log.Printf("Double the ASG size:")
 	log.Printf("\tmaxSize %d-->%d", originalAsg.maxSize, 2*originalAsg.maxSize)
 	log.Printf("\tdesiredCapacity %d-->%d", originalAsg.desiredCapacity, 2*originalAsg.desiredCapacity)
-	err = setASGCapacities(ctx, sess, asgName, 2*originalAsg.maxSize, 2*originalAsg.desiredCapacity)
+	err = updateASG(ctx, sess, asgName, 2*originalAsg.maxSize, 2*originalAsg.desiredCapacity, true)
 	if err != nil {
 		return err
 	}
 
 	log.Printf("Detect new instances and wait for them to be healthy\n")
 	newInstances, err := waitForNewInstances(ctx, sess, asgName, int(originalAsg.desiredCapacity), originalAsg.tg, originalAsg.instances)
-	if err != nil {
-		// rollback !
-		// TODO
-	}
-
-	// protect the new instances
-	log.Printf("Enable instance protection on the new instances\n")
-	err = setInstanceProtection(ctx, sess, asgName, newInstances)
 	if err != nil {
 		// rollback !
 		// TODO
@@ -83,7 +76,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	log.Printf("Set back the ASG size:")
 	log.Printf("\tmaxSize %d-->%d", 2*originalAsg.maxSize, originalAsg.maxSize)
 	log.Printf("\tdesiredCapacity %d-->%d", 2*originalAsg.desiredCapacity, originalAsg.desiredCapacity)
-	err = setASGCapacities(ctx, sess, asgName, originalAsg.maxSize, originalAsg.desiredCapacity)
+	err = updateASG(ctx, sess, asgName, originalAsg.maxSize, originalAsg.desiredCapacity, originalAsg.newInstanceProtected)
 	if err != nil {
 		// rollback !
 		// TODO
@@ -98,12 +91,14 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 		return err
 	}
 
-	// unprotect the new instances
-	log.Printf("Remove instance protection on the new instances\n")
-	err = removeInstanceProtection(ctx, sess, asgName, newInstances)
-	if err != nil {
-		// rollback !
-		// TODO
+	// unprotect the new instances if needed
+	if !originalAsg.newInstanceProtected {
+		log.Printf("Remove instance protection on the new instances\n")
+		err = removeInstanceProtection(ctx, sess, asgName, newInstances)
+		if err != nil {
+			// rollback !
+			// TODO
+		}
 	}
 
 	log.Printf("Done in %s.\n", time.Since(start))
@@ -112,10 +107,11 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 }
 
 type asg struct {
-	instances       []instance
-	tg              *targetGroup
-	maxSize         int64
-	desiredCapacity int64
+	instances            []instance
+	tg                   *targetGroup
+	maxSize              int64
+	desiredCapacity      int64
+	newInstanceProtected bool
 }
 
 type instance struct {
@@ -125,7 +121,7 @@ type instance struct {
 }
 
 func (i instance) String() string {
-	return fmt.Sprintf("%s lifecycle:%s asg-based health:%s", i.instanceId, i.lifecycleState, i.healthStatus)
+	return fmt.Sprintf("%s lifecycle:%s asg-based-health:%s", i.instanceId, i.lifecycleState, i.healthStatus)
 }
 
 type targetGroup struct {
@@ -165,20 +161,22 @@ func getASGDetails(ctx context.Context, sess *session.Session, asgName string) (
 	}
 
 	return &asg{
-		instances:       instances,
-		tg:              tg,
-		maxSize:         *out.AutoScalingGroups[0].MaxSize,
-		desiredCapacity: *out.AutoScalingGroups[0].DesiredCapacity,
+		instances:            instances,
+		tg:                   tg,
+		maxSize:              *out.AutoScalingGroups[0].MaxSize,
+		desiredCapacity:      *out.AutoScalingGroups[0].DesiredCapacity,
+		newInstanceProtected: *out.AutoScalingGroups[0].NewInstancesProtectedFromScaleIn,
 	}, nil
 }
 
-func setASGCapacities(ctx context.Context, sess *session.Session, asgName string, maxSize, desiredCapacity int64) error {
+func updateASG(ctx context.Context, sess *session.Session, asgName string, maxSize, desiredCapacity int64, enableProtection bool) error {
 	as := autoscaling.New(sess)
 
 	_, err := as.UpdateAutoScalingGroupWithContext(ctx, &autoscaling.UpdateAutoScalingGroupInput{
-		AutoScalingGroupName: aws.String(asgName),
-		DesiredCapacity:      aws.Int64(desiredCapacity),
-		MaxSize:              aws.Int64(maxSize),
+		AutoScalingGroupName:             aws.String(asgName),
+		DesiredCapacity:                  aws.Int64(desiredCapacity),
+		MaxSize:                          aws.Int64(maxSize),
+		NewInstancesProtectedFromScaleIn: aws.Bool(enableProtection),
 	})
 	return err
 }
