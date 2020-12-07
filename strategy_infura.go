@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -26,10 +27,10 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 		return err
 	}
 
-	fmt.Printf("Refresh (strategy: infura-refresh) started on ASG %s\n", asgName)
-	fmt.Printf("Existing instances:\n")
+	log.Printf("Refresh started (asg: %s, region: %s, strategy: infura-refresh)\n", asgName, region)
+	log.Printf("Existing instances:\n")
 	for _, inst := range originalAsg.instances {
-		fmt.Printf("\t%s\n", inst)
+		log.Printf("\t%s\n", inst)
 	}
 
 	// Record rollbacks during the procedure to get back on a reasonable state if the context get cancelled
@@ -40,21 +41,22 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	// })
 
 	// Set instance protection on the old instances to be sure we keep having them around in case of failure
-	fmt.Printf("Enable instance protection on old instances\n")
+	log.Printf("Enable instance protection on old instances\n")
 	err = setInstanceProtection(ctx, sess, asgName, originalAsg.instances)
 	if err != nil {
 		return err
 	}
 
 	// Double the ASG sizes
-	fmt.Printf("Double the ASG size:\n\tmaxSize %d-->%d\n\tdesiredCapacity %d-->%d\n",
-		originalAsg.maxSize, 2*originalAsg.maxSize, originalAsg.desiredCapacity, 2*originalAsg.desiredCapacity)
+	log.Printf("Double the ASG size:")
+	log.Printf("\tmaxSize %d-->%d", originalAsg.maxSize, 2*originalAsg.maxSize)
+	log.Printf("\tdesiredCapacity %d-->%d", originalAsg.desiredCapacity, 2*originalAsg.desiredCapacity)
 	err = setASGCapacities(ctx, sess, asgName, 2*originalAsg.maxSize, 2*originalAsg.desiredCapacity)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Detect new instances and wait for them to be healthy\n")
+	log.Printf("Detect new instances and wait for them to be healthy\n")
 	newInstances, err := waitForNewInstances(ctx, sess, asgName, int(originalAsg.desiredCapacity), originalAsg.tg, originalAsg.instances)
 	if err != nil {
 		// rollback !
@@ -62,7 +64,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	}
 
 	// protect the new instances
-	fmt.Printf("Enable instance protection on the new instances\n")
+	log.Printf("Enable instance protection on the new instances\n")
 	err = setInstanceProtection(ctx, sess, asgName, newInstances)
 	if err != nil {
 		// rollback !
@@ -70,7 +72,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	}
 
 	// unprotect the old instances
-	fmt.Printf("Remove instance protection on the old instances\n")
+	log.Printf("Remove instance protection on the old instances\n")
 	err = removeInstanceProtection(ctx, sess, asgName, originalAsg.instances)
 	if err != nil {
 		// rollback !
@@ -78,8 +80,9 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	}
 
 	// get back to normal size, cull the old instances
-	fmt.Printf("Set back the ASG size:\n\tmaxSize %d-->%d\n\tdesiredCapacity %d-->%d\n",
-		2*originalAsg.maxSize, originalAsg.maxSize, 2*originalAsg.desiredCapacity, originalAsg.desiredCapacity)
+	log.Printf("Set back the ASG size:")
+	log.Printf("\tmaxSize %d-->%d", 2*originalAsg.maxSize, originalAsg.maxSize)
+	log.Printf("\tdesiredCapacity %d-->%d", 2*originalAsg.desiredCapacity, originalAsg.desiredCapacity)
 	err = setASGCapacities(ctx, sess, asgName, originalAsg.maxSize, originalAsg.desiredCapacity)
 	if err != nil {
 		// rollback !
@@ -87,7 +90,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 		return err
 	}
 
-	fmt.Printf("Wait for scaling in\n")
+	log.Printf("Wait for scaling in\n")
 	err = waitForInstanceCount(ctx, sess, asgName, int(originalAsg.desiredCapacity))
 	if err != nil {
 		// rollback !
@@ -96,14 +99,14 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	}
 
 	// unprotect the new instances
-	fmt.Printf("Remove instance protection on the new instances\n")
+	log.Printf("Remove instance protection on the new instances\n")
 	err = removeInstanceProtection(ctx, sess, asgName, newInstances)
 	if err != nil {
 		// rollback !
 		// TODO
 	}
 
-	fmt.Printf("Done in %s.\n", time.Since(start))
+	log.Printf("Done in %s.\n", time.Since(start))
 
 	return nil
 }
@@ -122,7 +125,7 @@ type instance struct {
 }
 
 func (i instance) String() string {
-	return fmt.Sprintf("%s lifecycle:%s health:%s", i.instanceId, i.lifecycleState, i.healthStatus)
+	return fmt.Sprintf("%s lifecycle:%s asg-based health:%s", i.instanceId, i.lifecycleState, i.healthStatus)
 }
 
 type targetGroup struct {
@@ -225,7 +228,7 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 			case <-ctx.Done():
 				return
 			case err := <-chanErr:
-				fmt.Printf("error while polling ASG details: %v\n", err)
+				log.Printf("error while polling ASG details: %v\n", err)
 				continue
 			}
 		}
@@ -244,11 +247,11 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case err := <-chanErr2:
-			fmt.Printf("error while polling autoscaling or target group reported target health: %v\n", err)
+			log.Printf("error while polling autoscaling or target group reported target health: %v\n", err)
 			continue
 		case inst := <-readyInstances:
 			instanceReady = append(instanceReady, inst)
-			fmt.Printf("\t(%d/%d) Instance %s is ready\n", len(instanceReady), count, inst.instanceId)
+			log.Printf("\t(%d/%d) Instance %s is ready\n", len(instanceReady), count, inst.instanceId)
 			if len(instanceReady) >= count {
 				return instanceReady, nil
 			}
@@ -314,7 +317,7 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tg *target
 			case <-ctx.Done():
 				return
 			case inst := <-newInstances:
-				fmt.Printf("\tfound new instance: %s\n", inst)
+				log.Printf("\tfound new instance: %s\n", inst)
 				instanceSet[inst.instanceId] = inst
 			case <-time.After(period):
 				// wait to have at least one instance to inspect
@@ -435,7 +438,7 @@ func waitForInstanceCount(ctx context.Context, sess *session.Session, asgName st
 			return err
 		}
 
-		fmt.Printf("\tInstance count: %d\n", len(asg.instances))
+		log.Printf("\tInstance count: %d\n", len(asg.instances))
 		if len(asg.instances) <= count {
 			return nil
 		}
