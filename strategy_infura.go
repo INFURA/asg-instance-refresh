@@ -70,7 +70,8 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 			return updateASG(ctx, sess, asgName, originalAsg.maxSize, originalAsg.desiredCapacity, originalAsg.newInstanceProtected)
 		})
 
-		err = updateASG(ctx, sess, asgName, 2*originalAsg.maxSize, 2*originalAsg.desiredCapacity, true)
+		// No instance protection on the new instances so that the ASG can replace a failed instance if necessary
+		err = updateASG(ctx, sess, asgName, 2*originalAsg.maxSize, 2*originalAsg.desiredCapacity, false)
 		if err != nil {
 			rollback(err, rollbacks)
 			return err
@@ -273,6 +274,13 @@ func removeInstanceProtection(ctx context.Context, sess *session.Session, asgNam
 	return err
 }
 
+// waitForNewInstances:
+// - poll the ASG to detect new instances
+// - wait for them to be ready at the ASG level
+// - if any, wait for them to be ready at the TG level
+// - when ready, immediately enable scale-in protection to prevent them being destroyed
+//
+// Returns when count instance has been found.
 func waitForNewInstances(ctx context.Context, sess *session.Session, asgName string, count int, tg *targetGroup, currentInstances []instance) ([]instance, error) {
 	newInstances, chanErr := detectNewInstances(ctx, sess, asgName, currentInstances)
 
@@ -282,7 +290,9 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 			case <-ctx.Done():
 				return
 			case err := <-chanErr:
-				log.Printf("error while polling ASG details: %v", err)
+				if err != nil {
+					log.Printf("\terror while polling ASG details: %v", err)
+				}
 				continue
 			}
 		}
@@ -301,11 +311,20 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case err := <-chanErr2:
-			log.Printf("error while polling autoscaling or target group reported target health: %v", err)
+			if err != nil {
+				log.Printf("\terror while polling autoscaling or target group reported target health: %v", err)
+			}
 			continue
 		case inst := <-readyInstances:
 			instanceReady = append(instanceReady, inst)
-			log.Printf("\t(%d/%d) Instance %s is ready", len(instanceReady), count, inst.instanceId)
+			log.Printf("\t(%d/%d) Instance %s is ready, enabling scale-in protection ...", len(instanceReady), count, inst.instanceId)
+
+			err := setInstanceProtection(ctx, sess, asgName, []instance{inst})
+			if err != nil {
+				return nil, err
+			}
+			log.Printf("\tScale-in protection enabled on %s", inst.instanceId)
+
 			if len(instanceReady) >= count {
 				return instanceReady, nil
 			}
@@ -314,15 +333,15 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 }
 
 func detectNewInstances(ctx context.Context, sess *session.Session, asgName string, currentInstances []instance) (chan instance, chan error) {
-	oldSet := make(map[string]instance)
+	knownSet := make(map[string]instance)
 	for _, inst := range currentInstances {
-		oldSet[inst.instanceId] = inst
+		knownSet[inst.instanceId] = inst
 	}
 
 	chanOut := make(chan instance)
 	chanErr := make(chan error)
 
-	period := 5 * time.Second
+	period := 20 * time.Second
 
 	go func() {
 		defer close(chanOut)
@@ -343,9 +362,9 @@ func detectNewInstances(ctx context.Context, sess *session.Session, asgName stri
 			}
 
 			for _, inst := range asg.instances {
-				if _, has := oldSet[inst.instanceId]; !has {
+				if _, has := knownSet[inst.instanceId]; !has {
 					chanOut <- inst
-					oldSet[inst.instanceId] = inst
+					knownSet[inst.instanceId] = inst
 				}
 			}
 		}
@@ -483,7 +502,7 @@ func getHealthyTGInstances(ctx context.Context, sess *session.Session, tg target
 }
 
 func waitForInstanceCount(ctx context.Context, sess *session.Session, asgName string, count int) error {
-	period := 5 * time.Second
+	period := 20 * time.Second
 
 	for {
 		select {
