@@ -145,6 +145,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	return nil
 }
 
+// rollback execute the given rollback steps in *reverse order*
 func rollback(err error, steps []func(ctx context.Context) error) {
 	rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -163,11 +164,15 @@ func rollback(err error, steps []func(ctx context.Context) error) {
 	}
 }
 
+// asg hold the details of and AWS autoscaling group
 type asg struct {
-	instances            []instance
-	tg                   *targetGroup
-	maxSize              int64
-	desiredCapacity      int64
+	// the known instances
+	instances []instance
+	// the first target group defined to attach the instance to, if any
+	tg              *targetGroup
+	maxSize         int64
+	desiredCapacity int64
+	// whether or not the new instances get automatically protected against scale-in termination
 	newInstanceProtected bool
 }
 
@@ -185,6 +190,7 @@ type targetGroup struct {
 	arn string
 }
 
+// getASGDetails retrieve the relevant details from an AWS autoscaling group
 func getASGDetails(ctx context.Context, sess *session.Session, asgName string) (*asg, error) {
 	as := autoscaling.New(sess)
 
@@ -226,6 +232,7 @@ func getASGDetails(ctx context.Context, sess *session.Session, asgName string) (
 	}, nil
 }
 
+// updateASG set a few properties of an AWS autoscaling group, relevant for controlling a deployment
 func updateASG(ctx context.Context, sess *session.Session, asgName string, maxSize, desiredCapacity int64, enableProtection bool) error {
 	as := autoscaling.New(sess)
 
@@ -238,6 +245,7 @@ func updateASG(ctx context.Context, sess *session.Session, asgName string, maxSi
 	return err
 }
 
+// setInstanceProtection enable the scale-in protection on the given instances, to prevent the ASG from removing the instance
 func setInstanceProtection(ctx context.Context, sess *session.Session, asgName string, instances []instance) error {
 	as := autoscaling.New(sess)
 
@@ -256,6 +264,7 @@ func setInstanceProtection(ctx context.Context, sess *session.Session, asgName s
 	return err
 }
 
+// removeInstanceProtection remove the scale-in protection on the given instances, to give back the control to the ASG
 func removeInstanceProtection(ctx context.Context, sess *session.Session, asgName string, instances []instance) error {
 	as := autoscaling.New(sess)
 
@@ -282,6 +291,14 @@ func removeInstanceProtection(ctx context.Context, sess *session.Session, asgNam
 //
 // Returns when count instance has been found.
 func waitForNewInstances(ctx context.Context, sess *session.Session, asgName string, count int, tg *targetGroup, currentInstances []instance) ([]instance, error) {
+	// there is **four** endless loop bound to the the context lifecycle here:
+	// - one in `detectNewInstances()` doing ASG polling, which output to two **channels** for 1) values and 2) errors
+	// - the goroutine in this function that log and discards the errors from the error channel
+	// - the value channel get passed to `detectInstancesReady()` which poll the ASG health check and possibly the TG.
+	//   This function also output to two channels for values and errors
+	// - the for loop here that 1) log and discard errors from the second error channel and 2) read from the value channel,
+	//   set the instance protection and accumulate the healthy instances until we have the expected count
+
 	newInstances, chanErr := detectNewInstances(ctx, sess, asgName, currentInstances)
 
 	go func() {
@@ -332,6 +349,7 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 	}
 }
 
+// detectNewInstances poll the ASG to detect new instances. Instances given in currentInstances will not be reported.
 func detectNewInstances(ctx context.Context, sess *session.Session, asgName string, currentInstances []instance) (chan instance, chan error) {
 	knownSet := make(map[string]instance)
 	for _, inst := range currentInstances {
@@ -373,6 +391,8 @@ func detectNewInstances(ctx context.Context, sess *session.Session, asgName stri
 	return chanOut, chanErr
 }
 
+// detectInstancesReady poll the ASG to detect when instances passed via the newInstances channel are considered healthy.
+// If a target group is also given, it will also be polled for instance healthiness, which will ultimately query the instance custom health-check.
 func detectInstancesReady(ctx context.Context, sess *session.Session, tg *targetGroup, newInstances chan instance) (chan instance, chan error) {
 	chanOut := make(chan instance)
 	chanErr := make(chan error)
@@ -439,6 +459,7 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tg *target
 	return chanOut, chanErr
 }
 
+// getHealthyAutoscalingInstances query an ASG and report which of the given instances are healthy.
 func getHealthyAutoscalingInstances(ctx context.Context, sess *session.Session, instances map[string]instance) ([]instance, error) {
 	as := autoscaling.New(sess)
 
@@ -469,6 +490,7 @@ func getHealthyAutoscalingInstances(ctx context.Context, sess *session.Session, 
 	return healthyInstances, nil
 }
 
+// getHealthyTGInstances query a TG and report which of the given instances are healthy.
 func getHealthyTGInstances(ctx context.Context, sess *session.Session, tg targetGroup, instances []instance) ([]instance, error) {
 	elb := elbv2.New(sess)
 
@@ -501,6 +523,7 @@ func getHealthyTGInstances(ctx context.Context, sess *session.Session, tg target
 	return healthyInstances, nil
 }
 
+// waitForInstanceCount poll an ASG until the instance count is *lower or equal* the given count.
 func waitForInstanceCount(ctx context.Context, sess *session.Session, asgName string, count int) error {
 	period := 20 * time.Second
 
