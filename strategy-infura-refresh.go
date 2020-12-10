@@ -109,7 +109,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	// - new instances have the protection enabled
 	// For the rollback:
 	// - wait 10 minutes to give the ASG a chance to stabilize with keeping the new instances and removing the old ones
-	// - make sure to remove have the protection set as desired on the new instances
+	// - make sure to have the protection set as desired on the new instances
 	log.Printf("Wait for scaling in")
 	{
 		rollbacks = []func(ctx context.Context) error{
@@ -332,7 +332,11 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 				log.Printf("\terror while polling autoscaling or target group reported target health: %v", err)
 			}
 			continue
-		case inst := <-readyInstances:
+		case inst, ok := <-readyInstances:
+			if !ok {
+				// channel is closed, time to pack our things
+				return nil, nil
+			}
 			instanceReady = append(instanceReady, inst)
 			log.Printf("\t(%d/%d) Instance %s is ready, enabling scale-in protection ...", len(instanceReady), count, inst.instanceId)
 
@@ -409,7 +413,11 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tg *target
 			select {
 			case <-ctx.Done():
 				return
-			case inst := <-newInstances:
+			case inst, ok := <-newInstances:
+				if !ok {
+					// channel is closed, time to pack our things
+					return
+				}
 				log.Printf("\tfound new instance: %s", inst)
 				instanceSet[inst.instanceId] = inst
 			case <-time.After(period):
