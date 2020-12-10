@@ -44,7 +44,7 @@ func main() {
 	}()
 
 	switch strings.ToLower(*strategy) {
-	case "rolling": // natively supported AWS strategies
+	case "rolling": // natively supported AWS strategies (case insensitive)
 		err = strategyAWS(ctx, *region, asgName, *strategy, *warmup, *minHealthy, *wait)
 	case "infura-refresh":
 		err = strategyInfuraRefresh(ctx, *region, asgName)
