@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -22,9 +24,21 @@ func strategyAWS(ctx context.Context, region string, asgName string, strategy st
 		prefs.InstanceWarmup = aws.Int64(warmup)
 	}
 
+	var awsStrategy *string
+	strategies := autoscaling.RefreshStrategy_Values()
+	for _, s := range strategies {
+		if strings.ToLower(s) == strings.ToLower(strategy) {
+			awsStrategy = aws.String(s)
+		}
+	}
+
+	if awsStrategy == nil {
+		return errors.New(fmt.Sprintf("strategy %s not an AWS strategy in %v", strategy, strategies))
+	}
+
 	input := &autoscaling.StartInstanceRefreshInput{
 		AutoScalingGroupName: aws.String(asgName),
-		Strategy:             aws.String(strategy),
+		Strategy:             awsStrategy,
 		Preferences:          prefs,
 	}
 
