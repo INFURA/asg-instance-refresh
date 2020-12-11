@@ -325,6 +325,7 @@ func suspendAutoscaling(ctx context.Context, sess *session.Session, asgName stri
 		ScalingProcesses: []*string{
 			aws.String("AlarmNotification"),
 			aws.String("ScheduledActions"),
+			aws.String("AZRebalance"),
 		},
 	})
 
@@ -344,6 +345,9 @@ func resumeAutoscaling(ctx context.Context, sess *session.Session, asgName strin
 	}
 	if _, ok := originalSuspendedProcesses["ScheduledActions"]; !ok {
 		toResume = append(toResume, aws.String("ScheduledActions"))
+	}
+	if _, ok := originalSuspendedProcesses["AZRebalance"]; !ok {
+		toResume = append(toResume, aws.String("AZRebalance"))
 	}
 
 	_, err := as.ResumeProcessesWithContext(ctx, &autoscaling.ScalingProcessQuery{
