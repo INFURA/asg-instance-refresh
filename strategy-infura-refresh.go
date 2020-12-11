@@ -37,6 +37,20 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 		log.Printf("\t%s", inst)
 	}
 
+	log.Printf("Disable autoscaling processes")
+	{
+		rollbacks = append(rollbacks, func(ctx context.Context) error {
+			log.Printf("Restore autoscaling processes")
+			return resumeAutoscaling(ctx, sess, asgName, originalAsg.suspendedProcesses)
+		})
+
+		err = suspendAutoscaling(ctx, sess, asgName)
+		if err != nil {
+			rollback(err, rollbacks)
+			return err
+		}
+	}
+
 	// Set instance protection on the old instances to be sure we keep having them around in case of failure
 	log.Printf("Enable instance protection on old instances")
 	{
@@ -140,6 +154,14 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 		}
 	}
 
+	log.Printf("Restore autoscaling processes")
+	{
+		err = resumeAutoscaling(ctx, sess, asgName, originalAsg.suspendedProcesses)
+		if err != nil {
+			return err
+		}
+	}
+
 	log.Printf("Done in %s.", time.Since(start))
 
 	return nil
@@ -174,6 +196,8 @@ type asg struct {
 	desiredCapacity int64
 	// whether or not the new instances get automatically protected against scale-in termination
 	newInstanceProtected bool
+	// the suspended autoscaling process, if any
+	suspendedProcesses map[string]struct{}
 }
 
 type instance struct {
@@ -223,12 +247,19 @@ func getASGDetails(ctx context.Context, sess *session.Session, asgName string) (
 		}
 	}
 
+	suspendedProcesses := make(map[string]struct{}, len(out.AutoScalingGroups[0].SuspendedProcesses))
+
+	for _, process := range out.AutoScalingGroups[0].SuspendedProcesses {
+		suspendedProcesses[*process.ProcessName] = struct{}{}
+	}
+
 	return &asg{
 		instances:            instances,
 		tg:                   tg,
 		maxSize:              *out.AutoScalingGroups[0].MaxSize,
 		desiredCapacity:      *out.AutoScalingGroups[0].DesiredCapacity,
 		newInstanceProtected: *out.AutoScalingGroups[0].NewInstancesProtectedFromScaleIn,
+		suspendedProcesses:   suspendedProcesses,
 	}, nil
 }
 
@@ -278,6 +309,46 @@ func removeInstanceProtection(ctx context.Context, sess *session.Session, asgNam
 		AutoScalingGroupName: aws.String(asgName),
 		InstanceIds:          ids,
 		ProtectedFromScaleIn: aws.Bool(false),
+	})
+
+	return err
+}
+
+// suspendAutoscaling disable the autonomous scaling actions on an ASG
+// - scaling based on cloudwatch alarms
+// - scaling based on predictive features
+func suspendAutoscaling(ctx context.Context, sess *session.Session, asgName string) error {
+	as := autoscaling.New(sess)
+
+	_, err := as.SuspendProcessesWithContext(ctx, &autoscaling.ScalingProcessQuery{
+		AutoScalingGroupName: aws.String(asgName),
+		ScalingProcesses: []*string{
+			aws.String("AlarmNotification"),
+			aws.String("ScheduledActions"),
+		},
+	})
+
+	return err
+}
+
+// resumeAutoscaling enable the given autonomous scaling actions on an ASG
+func resumeAutoscaling(ctx context.Context, sess *session.Session, asgName string, originalSuspendedProcesses map[string]struct{}) error {
+	as := autoscaling.New(sess)
+
+	// we need to construct the list of process we want to resume
+
+	var toResume []*string
+
+	if _, ok := originalSuspendedProcesses["AlarmNotification"]; !ok {
+		toResume = append(toResume, aws.String("AlarmNotification"))
+	}
+	if _, ok := originalSuspendedProcesses["ScheduledActions"]; !ok {
+		toResume = append(toResume, aws.String("ScheduledActions"))
+	}
+
+	_, err := as.ResumeProcessesWithContext(ctx, &autoscaling.ScalingProcessQuery{
+		AutoScalingGroupName: aws.String(asgName),
+		ScalingProcesses:     toResume,
 	})
 
 	return err
