@@ -2,6 +2,10 @@
 
 `asg-instance-refresh` is a minimal CLI tool to trigger an [instance refresh](https://docs.aws.amazon.com/autoscaling/ec2/userguide/asg-instance-refresh.html) on a EC2 autoscaling group.
 
+## Installation
+
+`GO111MODULE=off go get -u github.com/INFURA/asg-instance-refresh`
+
 ## Usage
 
 `asg-instance-refresh <asg-name>`
