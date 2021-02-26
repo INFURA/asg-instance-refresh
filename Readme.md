@@ -4,7 +4,7 @@
 
 ## Usage
 
-`asg-instance-refresg <asg-name>`
+`asg-instance-refresh <asg-name>`
 
 ## Flags
 
