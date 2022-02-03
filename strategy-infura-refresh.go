@@ -95,6 +95,12 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	log.Printf("Detect new instances and wait for them to be healthy")
 	newInstances, err := waitForNewInstances(ctx, sess, asgName, int(originalAsg.desiredCapacity), originalAsg.tg, originalAsg.instances)
 	if err != nil {
+		rollbacks = append(rollbacks, func(ctx context.Context) error {
+			if len(newInstances) > 0 {
+				return removeInstanceProtection(ctx, sess, asgName, newInstances)
+			}
+			return nil
+		})
 		rollback(err, rollbacks)
 		return err
 	}
@@ -401,7 +407,7 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return instanceReady, ctx.Err()
 		case err := <-chanErr2:
 			if err != nil {
 				log.Printf("\terror while polling autoscaling or target group reported target health: %v", err)
@@ -412,14 +418,15 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 				// channel is closed, time to pack our things
 				return nil, nil
 			}
-			instanceReady = append(instanceReady, inst)
-			log.Printf("\t(%d/%d) Instance %s is ready, enabling scale-in protection ...", len(instanceReady), count, inst.instanceId)
+			log.Printf("\t(%d/%d) Instance %s is ready, enabling scale-in protection ...", len(instanceReady)+1, count, inst.instanceId)
 
 			err := setInstanceProtection(ctx, sess, asgName, []instance{inst})
 			if err != nil {
-				return nil, err
+				return instanceReady, err
 			}
 			log.Printf("\tScale-in protection enabled on %s", inst.instanceId)
+
+			instanceReady = append(instanceReady, inst)
 
 			if len(instanceReady) >= count {
 				return instanceReady, nil
