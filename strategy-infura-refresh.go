@@ -93,7 +93,7 @@ func strategyInfuraRefresh(ctx context.Context, region string, asgName string) e
 	}
 
 	log.Printf("Detect new instances and wait for them to be healthy")
-	newInstances, err := waitForNewInstances(ctx, sess, asgName, int(originalAsg.desiredCapacity), originalAsg.tg, originalAsg.instances)
+	newInstances, err := waitForNewInstances(ctx, sess, asgName, int(originalAsg.desiredCapacity), originalAsg.targetGroups, originalAsg.instances)
 	if err != nil {
 		rollbacks = append(rollbacks, func(ctx context.Context) error {
 			if len(newInstances) > 0 {
@@ -197,7 +197,7 @@ type asg struct {
 	// the known instances
 	instances []instance
 	// the first target group defined to attach the instance to, if any
-	tg              *targetGroup
+	targetGroups    []targetGroup
 	maxSize         int64
 	desiredCapacity int64
 	// whether or not the new instances get automatically protected against scale-in termination
@@ -245,12 +245,11 @@ func getASGDetails(ctx context.Context, sess *session.Session, asgName string) (
 		}
 	}
 
-	var tg *targetGroup
-
-	if len(out.AutoScalingGroups[0].TargetGroupARNs) > 0 {
-		tg = &targetGroup{
-			arn: *out.AutoScalingGroups[0].TargetGroupARNs[0],
-		}
+	var targetGroups []targetGroup
+	for _, tgs := range out.AutoScalingGroups[0].TargetGroupARNs {
+		targetGroups = append(targetGroups, targetGroup{
+			arn: *tgs,
+		})
 	}
 
 	suspendedProcesses := make(map[string]struct{}, len(out.AutoScalingGroups[0].SuspendedProcesses))
@@ -261,7 +260,7 @@ func getASGDetails(ctx context.Context, sess *session.Session, asgName string) (
 
 	return &asg{
 		instances:            instances,
-		tg:                   tg,
+		targetGroups:         targetGroups,
 		maxSize:              *out.AutoScalingGroups[0].MaxSize,
 		desiredCapacity:      *out.AutoScalingGroups[0].DesiredCapacity,
 		newInstanceProtected: *out.AutoScalingGroups[0].NewInstancesProtectedFromScaleIn,
@@ -371,7 +370,7 @@ func resumeAutoscaling(ctx context.Context, sess *session.Session, asgName strin
 // - when ready, immediately enable scale-in protection to prevent them being destroyed
 //
 // Returns when count instance has been found.
-func waitForNewInstances(ctx context.Context, sess *session.Session, asgName string, count int, tg *targetGroup, currentInstances []instance) ([]instance, error) {
+func waitForNewInstances(ctx context.Context, sess *session.Session, asgName string, count int, tgs []targetGroup, currentInstances []instance) ([]instance, error) {
 	// there is **four** endless loop bound to the the context lifecycle here:
 	// - one in `detectNewInstances()` doing ASG polling, which output to two **channels** for 1) values and 2) errors
 	// - the goroutine in this function that log and discards the errors from the error channel
@@ -400,7 +399,7 @@ func waitForNewInstances(ctx context.Context, sess *session.Session, asgName str
 	subCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	readyInstances, chanErr2 := detectInstancesReady(subCtx, sess, tg, newInstances)
+	readyInstances, chanErr2 := detectInstancesReady(subCtx, sess, tgs, newInstances)
 
 	instanceReady := make([]instance, 0, count)
 
@@ -479,7 +478,7 @@ func detectNewInstances(ctx context.Context, sess *session.Session, asgName stri
 
 // detectInstancesReady poll the ASG to detect when instances passed via the newInstances channel are considered healthy.
 // If a target group is also given, it will also be polled for instance healthiness, which will ultimately query the instance custom health-check.
-func detectInstancesReady(ctx context.Context, sess *session.Session, tg *targetGroup, newInstances chan instance) (chan instance, chan error) {
+func detectInstancesReady(ctx context.Context, sess *session.Session, tgs []targetGroup, newInstances chan instance) (chan instance, chan error) {
 	chanOut := make(chan instance)
 	chanErr := make(chan error)
 
@@ -518,7 +517,7 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tg *target
 			}
 
 			// if we don't have a target group, end the checks here
-			if tg == nil {
+			if len(tgs) == 0 {
 				for _, inst := range healthyInstances {
 					delete(instanceSet, inst.instanceId)
 					chanOut <- inst
@@ -532,7 +531,7 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tg *target
 			}
 
 			// we have a target group, let's also inspect the reported health
-			healthyInstances, err = getHealthyTGInstances(ctx, sess, *tg, healthyInstances)
+			healthyInstances, err = getHealthyTGInstances(ctx, sess, tgs, healthyInstances)
 			if err != nil {
 				chanErr <- err
 				// don't stop on error, let the caller decide what to do
@@ -580,8 +579,8 @@ func getHealthyAutoscalingInstances(ctx context.Context, sess *session.Session, 
 	return healthyInstances, nil
 }
 
-// getHealthyTGInstances query a TG and report which of the given instances are healthy.
-func getHealthyTGInstances(ctx context.Context, sess *session.Session, tg targetGroup, instances []instance) ([]instance, error) {
+// getHealthyTGInstances query all TGs and report which of the given instances are healthy in all of them.
+func getHealthyTGInstances(ctx context.Context, sess *session.Session, tgs []targetGroup, instances []instance) ([]instance, error) {
 	elb := elbv2.New(sess)
 
 	instanceMap := make(map[string]instance)
@@ -594,19 +593,34 @@ func getHealthyTGInstances(ctx context.Context, sess *session.Session, tg target
 		})
 	}
 
-	out, err := elb.DescribeTargetHealthWithContext(ctx, &elbv2.DescribeTargetHealthInput{
-		TargetGroupArn: aws.String(tg.arn),
-		Targets:        targets,
-	})
-	if err != nil {
-		return nil, err
+	healthyInstancesSet := make(map[string]int)
+
+	for _, tg := range tgs {
+		out, err := elb.DescribeTargetHealthWithContext(ctx, &elbv2.DescribeTargetHealthInput{
+			TargetGroupArn: aws.String(tg.arn),
+			Targets:        targets,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, description := range out.TargetHealthDescriptions {
+			if *description.TargetHealth.State == elbv2.TargetHealthStateEnumHealthy {
+				_, ok := healthyInstancesSet[*description.Target.Id]
+				if ok {
+					healthyInstancesSet[*description.Target.Id]++
+				} else {
+					healthyInstancesSet[*description.Target.Id] = 1
+				}
+			}
+		}
 	}
 
 	var healthyInstances []instance
 
-	for _, description := range out.TargetHealthDescriptions {
-		if *description.TargetHealth.State == elbv2.TargetHealthStateEnumHealthy {
-			healthyInstances = append(healthyInstances, instanceMap[*description.Target.Id])
+	for id, count := range healthyInstancesSet {
+		if count == len(tgs) {
+			healthyInstances = append(healthyInstances, instanceMap[id])
 		}
 	}
 
