@@ -482,7 +482,7 @@ func detectInstancesReady(ctx context.Context, sess *session.Session, tgs []targ
 	chanOut := make(chan instance)
 	chanErr := make(chan error)
 
-	period := 20 * time.Second
+	period := 2 * time.Minute
 
 	go func() {
 		defer close(chanOut)
@@ -629,7 +629,7 @@ func getHealthyTGInstances(ctx context.Context, sess *session.Session, tgs []tar
 
 // waitForInstanceCount poll an ASG until the instance count is *lower or equal* the given count.
 func waitForInstanceCount(ctx context.Context, sess *session.Session, asgName string, count int) error {
-	period := 20 * time.Second
+	period := 2 * time.Minute
 
 	for {
 		select {
